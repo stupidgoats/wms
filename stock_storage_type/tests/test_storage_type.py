@@ -14,6 +14,9 @@ class TestStorageType(SavepointCase):
         cls.pallets_location_storage_type = cls.env.ref(
             "stock_storage_type.location_storage_type_pallets"
         )
+        cls.pallets_uk_location_storage_type = cls.env.ref(
+            "stock_storage_type.location_storage_type_pallets_uk"
+        )
         cls.cardboxes_location_storage_type = cls.env.ref(
             "stock_storage_type.location_storage_type_cardboxes"
         )
@@ -107,3 +110,43 @@ class TestStorageType(SavepointCase):
 
     def test_location_leaf_locations_on_leaf(self):
         self.assertEqual(self.cardboxes_bin_3.leaf_location_ids, self.cardboxes_bin_3)
+
+    def test_location_max_height(self):
+        self.pallets_location_storage_type.max_height = 2
+        self.pallets_uk_location_storage_type.max_height = 3
+        self.cardboxes_location_storage_type.max_height = 0
+        test_location = self.env["stock.location"].create(
+            {
+                "name": "TEST",
+                "location_storage_type_ids": [
+                    (
+                        6,
+                        0,
+                        [
+                            self.pallets_location_storage_type.id,
+                            self.pallets_uk_location_storage_type.id,
+                            self.cardboxes_location_storage_type.id,
+                        ],
+                    ),
+                ],
+            }
+        )
+        self.assertEqual(test_location.max_height, 0)
+        self.cardboxes_location_storage_type.max_height = 1
+        self.assertEqual(test_location.max_height, 3)
+
+    def test_archive_package_storage_type(self):
+        target = self.env.ref("stock_storage_type.package_storage_type_pallets")
+        all_package_storage_types = self.env["stock.package.storage.type"].search([])
+        self.assertIn(target, all_package_storage_types)
+        target.active = False
+        all_package_storage_types = self.env["stock.package.storage.type"].search([])
+        self.assertNotIn(target, all_package_storage_types)
+
+    def test_archive_location_storage_type(self):
+        target = self.env.ref("stock_storage_type.location_storage_type_pallets")
+        all_location_storage_types = self.env["stock.location.storage.type"].search([])
+        self.assertIn(target, all_location_storage_types)
+        target.active = False
+        all_location_storage_types = self.env["stock.location.storage.type"].search([])
+        self.assertNotIn(target, all_location_storage_types)

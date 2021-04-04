@@ -16,8 +16,15 @@
                 <field name="city" optional="show" />
             </field>
             <field name="product_uom_qty" position="after">
-                <field name="ordered_available_to_promise" />
+                <field name="ordered_available_to_promise_uom_qty" />
+                <field
+                    name="previous_promised_qty"
+                    optional="hide"
+                    groups="base.group_no_one"
+                />
+                <field name="release_ready" optional="show" />
                 <field name="date_priority" />
+                <field name="priority" />
             </field>
             <field name="location_id" position="attributes">
                 <attribute name="optional">hide</attribute>
@@ -41,13 +48,28 @@
                 <attribute name="string">Shipment date</attribute>
             </field>
             <group name="main_grp_col2" position="inside">
-                <field name="ordered_available_to_promise" />
+                <field name="ordered_available_to_promise_uom_qty" />
                 <field name="date_priority" />
             </group>
         </field>
     </record>
+    <record id="view_move_release_search" model="ir.ui.view">
+        <field name="name">stock.move.release.search</field>
+        <field name="model">stock.move</field>
+        <field name="inherit_id" ref="stock.view_move_search" />
+        <field name="arch" type="xml">
+            <field name="partner_id" position="after">
+                <filter
+                    string="Release Ready"
+                    name="release_ready"
+                    domain="[('release_ready', '=', True)]"
+                />
+                <separator />
+            </field>
+        </field>
+    </record>
     <record id="stock_move_release_action" model="ir.actions.act_window">
-        <field name="name">Stock Allocation</field>
+        <field name="name">Moves Allocations</field>
         <field name="res_model">stock.move</field>
         <field name="type">ir.actions.act_window</field>
         <field name="view_mode">tree,kanban,form</field>
@@ -60,7 +82,9 @@
                      (0, 0, {'view_mode': 'form', 'view_id': ref('view_move_release_form')}),
                      ]"
         />
-        <field name="context">{'search_default_groupby_picking_id': 1}</field>
+        <field
+            name="context"
+        >{'search_default_groupby_picking_id': 1, 'search_default_release_ready': 1}</field>
         <field name="domain">[('need_release', '=' , True)]</field>
         <field name="help" type="html">
             <p class="o_view_nocontent_smiling_face">
@@ -76,7 +100,7 @@
     <menuitem
         action="stock_move_release_action"
         id="stock_move_release_menu"
-        parent="stock.menu_stock_warehouse_mgmt"
+        parent="stock.menu_warehouse_report"
         sequence="10"
         groups="stock.group_stock_manager,stock.group_stock_user"
     />

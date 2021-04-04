@@ -3,6 +3,7 @@
 import logging
 
 from odoo import api, fields, models
+from odoo.tools import float_compare
 
 _logger = logging.getLogger(__name__)
 
@@ -57,7 +58,9 @@ class StockLocation(models.Model):
         compute="_compute_location_is_empty",
         store=True,
         help="technical field: True if the location is empty "
-        "and there is no pending incoming products in the location",
+        "and there is no pending incoming products in the location. "
+        " Computed only if the location needs to check for emptiness "
+        '(has an "only empty" location storage type).',
     )
 
     in_move_ids = fields.One2many(
@@ -76,6 +79,15 @@ class StockLocation(models.Model):
             ("state", "in", ("waiting", "confirmed", "partially_available", "assigned"))
         ],
         help="technical field: the pending incoming "
+        "stock.move.lines in the location",
+    )
+    out_move_line_ids = fields.One2many(
+        "stock.move.line",
+        "location_id",
+        domain=[
+            ("state", "in", ("waiting", "confirmed", "partially_available", "assigned"))
+        ],
+        help="technical field: the pending outgoing "
         "stock.move.lines in the location",
     )
     location_will_contain_lot_ids = fields.Many2many(
@@ -98,6 +110,53 @@ class StockLocation(models.Model):
         compute="_compute_leaf_location_ids",
         help="technical field: all the leaves sub-locations",
     )
+    max_height = fields.Float(
+        string="Max height (mm)",
+        compute="_compute_max_height",
+        store=True,
+        help="The max height supported among allowed location storage types.",
+    )
+    do_not_mix_products = fields.Boolean(
+        compute="_compute_do_not_mix_products", store=True,
+    )
+    do_not_mix_lots = fields.Boolean(compute="_compute_do_not_mix_lots", store=True,)
+    only_empty = fields.Boolean(compute="_compute_only_empty", store=True,)
+
+    @api.depends(
+        "usage",
+        "allowed_location_storage_type_ids",
+        "allowed_location_storage_type_ids.do_not_mix_products",
+    )
+    def _compute_do_not_mix_products(self):
+        for rec in self:
+            rec.do_not_mix_products = rec.usage == "internal" and any(
+                storage_type.do_not_mix_products
+                for storage_type in rec.allowed_location_storage_type_ids
+            )
+
+    @api.depends(
+        "usage",
+        "allowed_location_storage_type_ids",
+        "allowed_location_storage_type_ids.do_not_mix_lots",
+    )
+    def _compute_do_not_mix_lots(self):
+        for rec in self:
+            rec.do_not_mix_lots = rec.usage == "internal" and any(
+                storage_type.do_not_mix_lots
+                for storage_type in rec.allowed_location_storage_type_ids
+            )
+
+    @api.depends(
+        "usage",
+        "allowed_location_storage_type_ids",
+        "allowed_location_storage_type_ids.only_empty",
+    )
+    def _compute_only_empty(self):
+        for rec in self:
+            rec.only_empty = rec.usage == "internal" and any(
+                storage_type.only_empty
+                for storage_type in rec.allowed_location_storage_type_ids
+            )
 
     @api.depends("child_ids.leaf_location_ids")
     def _compute_leaf_location_ids(self):
@@ -126,29 +185,72 @@ class StockLocation(models.Model):
             leaves = self.search([("id", "in", leave_ids)])
             loc.leaf_location_ids = leaves
 
-    @api.depends("quant_ids", "in_move_ids", "in_move_line_ids")
+    def _should_compute_will_contain_product_ids(self):
+        return self.do_not_mix_products
+
+    def _should_compute_will_contain_lot_ids(self):
+        return self.do_not_mix_lots
+
+    def _should_compute_location_is_empty(self):
+        return self.only_empty
+
+    @api.depends(
+        "quant_ids", "in_move_ids", "in_move_line_ids", "do_not_mix_products",
+    )
     def _compute_location_will_contain_product_ids(self):
         for rec in self:
-            rec.location_will_contain_product_ids = (
+            if not rec._should_compute_will_contain_product_ids():
+                if rec.location_will_contain_product_ids:
+                    no_product = self.env["product.product"].browse()
+                    rec.location_will_contain_product_ids = no_product
+                continue
+            products = (
                 rec.mapped("quant_ids.product_id")
                 | rec.mapped("in_move_ids.product_id")
                 | rec.mapped("in_move_line_ids.product_id")
             )
-
-    @api.depends("quant_ids", "in_move_line_ids")
-    def _compute_location_will_contain_lot_ids(self):
-        for rec in self:
-            rec.location_will_contain_lot_ids = rec.mapped(
-                "quant_ids.lot_id"
-            ) | rec.mapped("in_move_line_ids.lot_id")
+            rec.location_will_contain_product_ids = products
 
     @api.depends(
-        "quant_ids.quantity", "in_move_ids", "in_move_line_ids",
+        "quant_ids", "in_move_line_ids", "do_not_mix_lots",
+    )
+    def _compute_location_will_contain_lot_ids(self):
+        for rec in self:
+            if not rec._should_compute_will_contain_lot_ids():
+                if rec.location_will_contain_lot_ids:
+                    no_lot = self.env["stock.production.lot"].browse()
+                    rec.location_will_contain_lot_ids = no_lot
+                continue
+            lots = rec.mapped("quant_ids.lot_id") | rec.mapped(
+                "in_move_line_ids.lot_id"
+            )
+            rec.location_will_contain_lot_ids = lots
+
+    @api.depends(
+        "quant_ids.quantity",
+        "out_move_line_ids.qty_done",
+        "in_move_ids",
+        "in_move_line_ids",
+        "only_empty",
     )
     def _compute_location_is_empty(self):
         for rec in self:
+            # No restriction should apply on customer/supplier/...
+            # locations and we don't need to compute is empty
+            # if there is no limit on the location
+            if not rec._should_compute_location_is_empty():
+                # avoid write if not required
+                if not rec.location_is_empty:
+                    rec.location_is_empty = True
+                continue
+            # we do want to keep a write here even if the value is the same
+            # to enforce concurrent transaction safety: 2 moves taking
+            # quantities in a location have to be executed sequentially
+            # or the location could remain "not empty"
             if (
                 sum(rec.quant_ids.mapped("quantity"))
+                - sum(rec.out_move_line_ids.mapped("qty_done"))
+                > 0
                 or rec.in_move_ids
                 or rec.in_move_line_ids
             ):
@@ -172,6 +274,22 @@ class StockLocation(models.Model):
                 location.allowed_location_storage_type_ids = [
                     (6, 0, parent.allowed_location_storage_type_ids.ids)
                 ]
+
+    @api.depends("allowed_location_storage_type_ids.max_height")
+    def _compute_max_height(self):
+        """Get the max height supported by location types, knowing that a max
+        height of 0 means 'no limit', so it's considered as the maximum value.
+        """
+        for location in self:
+            allowed_types = location.allowed_location_storage_type_ids
+            types_with_max_height = allowed_types.filtered(
+                lambda o: bool(o.max_height)
+            ).sorted("max_height", reverse=True)
+            types_without_max_height = allowed_types - types_with_max_height
+            types_sorted = types_without_max_height + types_with_max_height
+            location.max_height = (
+                types_sorted.mapped("max_height")[0] if types_sorted else 0
+            )
 
     # method provided by "stock_putaway_hook"
     def _putaway_strategy_finalizer(self, putaway_location, product):
@@ -279,20 +397,53 @@ class StockLocation(models.Model):
                 ("max_height", "=", 0),
                 ("max_height", ">=", quants.package_id.height),
             ]
-        if quants.package_id.pack_weight:
+        package_weight = (
+            quants.package_id.pack_weight or quants.package_id.estimated_pack_weight
+        )
+        if package_weight:
             pertinent_loc_storagetype_domain += [
                 "|",
                 ("max_weight", "=", 0),
-                ("max_weight", ">=", quants.package_id.pack_weight),
+                ("max_weight", ">=", package_weight),
             ]
         _logger.debug(
             "pertinent storage type domain: %s", pertinent_loc_storagetype_domain
         )
         return pertinent_loc_storagetype_domain
 
+    def _allowed_locations_for_location_storage_types(
+        self, location_storage_types, quants, products
+    ):
+        valid_location_ids = set()
+        for loc_storage_type in location_storage_types:
+            location_domain = loc_storage_type._domain_location_storage_type(
+                self, quants, products
+            )
+            _logger.debug("pertinent location domain: %s", location_domain)
+            locations = self.search(location_domain)
+            valid_location_ids |= set(locations.ids)
+        return self.browse(valid_location_ids)
+
+    def _select_final_valid_putaway_locations(self, limit=None):
+        """Return the valid locations using the provided limit
+
+        ``self`` contains locations already ordered and contains
+        only valid locations.
+        This method can be used as a hook to add or remove valid
+        locations based on other properties. Pay attention to
+        keep the order.
+        """
+        return self[:limit]
+
     def select_allowed_locations(
         self, package_storage_type, quants, products, limit=None
     ):
+        """Filter allowed locations for a storage type
+
+        ``self`` contains locations already ordered according to the
+        putaway strategy, so beware of the return that must keep the
+        same order
+        """
         # We have package who may be placed in a stock.location
         #
         # 1. On the stock.location there are location_storage_type and on the
@@ -328,17 +479,13 @@ class StockLocation(models.Model):
 
         # now loop over the pertinent location storage types (there should be
         # few of them) and check for properties to find suitable locations
-        valid_location_ids = set()
-        for loc_storage_type in pertinent_loc_storage_types:
-            location_domain = loc_storage_type._domain_location_storage_type(
-                compatible_locations, quants, products
-            )
-            _logger.debug("pertinent location domain: %s", location_domain)
-            locations = self.search(location_domain, limit=limit)
-            valid_location_ids |= set(locations.ids)
+        valid_locations = compatible_locations._allowed_locations_for_location_storage_types(  # noqa
+            pertinent_loc_storage_types, quants, products
+        )
 
-        valid_locations = self.env["stock.location"].search(
-            [("id", "in", list(valid_location_ids))], limit=limit
+        valid_locations = self._order_allowed_locations(valid_locations)
+        valid_locations = valid_locations._select_final_valid_putaway_locations(
+            limit=limit
         )
 
         _logger.debug(
@@ -351,12 +498,49 @@ class StockLocation(models.Model):
         )
         return valid_locations
 
+    def _order_allowed_locations(self, valid_locations):
+        """Return the ordered list of valid_locations
+
+        By default the order should be the same as self. However, if the
+        valid_locations list contains locations configured to not mix products,
+        we must give priority to locations that already contains products
+        (the ones with less qty first)
+        """
+        valid_no_mix = valid_locations.filtered("do_not_mix_products")
+        loc_ordered_by_qty = []
+        if valid_no_mix:
+            StockQuant = self.env["stock.quant"]
+            domain_quant = [("location_id", "in", valid_no_mix.ids)]
+            loc_ordered_by_qty = [
+                item["location_id"][0]
+                for item in StockQuant.read_group(
+                    domain_quant,
+                    ["location_id", "quantity"],
+                    ["location_id"],
+                    orderby="quantity",
+                )
+                if (float_compare(item["quantity"], 0, precision_digits=2) > 0)
+            ]
+        valid_location_ids = set(valid_locations.ids) - set(loc_ordered_by_qty)
+        ordered_valid_location_ids = loc_ordered_by_qty + [
+            id_ for id_ in self.ids if id_ in valid_location_ids
+        ]
+        valid_locations = self.browse(ordered_valid_location_ids)
+        return valid_locations
+
     def _get_ordered_leaf_locations(self):
         """Return ordered leaf sub-locations
 
         The locations are candidate locations that will be evaluated one per
         one in order to find the first available location. They must be leaf
         locations where we can actually put goods.
+
+        Locations are ordered by max height, knowing that a max height of 0
+        means "no limit" and as such it should be among the last locations.
         """
-        # Call sorted() to ensure the _order is respected
-        return self.leaf_location_ids.sorted()
+        if not self.leaf_location_ids:
+            return self.leaf_location_ids
+        max_height = max(self.leaf_location_ids.mapped("max_height"))
+        return self.leaf_location_ids.sorted(
+            lambda l: l.max_height if l.max_height else (max_height + 1)
+        )
